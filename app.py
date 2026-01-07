@@ -426,15 +426,13 @@ def manychat_webhook():
     """ManyChat вебхук endpoint"""
     try:
         data = request.json
-        
-        # ManyChat өөр форматаар ирж болно
+
         if not data:
             return jsonify({"error": "Хоосон хүсэлт"}), 400
-        
-        # Олон форматыг дэмжих
+
         subscriber_id = None
         user_message = ""
-        
+
         if 'subscriber' in data:
             subscriber_id = data['subscriber'].get('id')
             user_message = data.get('message', {}).get('text', '').strip()
@@ -445,65 +443,63 @@ def manychat_webhook():
             subscriber_id = data['data']['subscriber'].get('id')
             user_message = data.get('data', {}).get('message', '').strip()
         else:
-            # Бусад формат
             logger.warning(f"❌ Unknown ManyChat format: {data.keys()}")
-            # Дэмжихгүй формат бол default утга өгөх
             subscriber_id = "unknown"
             user_message = data.get('text', data.get('message', 'сайн уу')).strip()
-        
+
         if not subscriber_id:
             return jsonify({"error": "Subscriber ID олдсонгүй"}), 400
-        
+
         if not user_message:
             user_message = "сайн уу"
-        
+
         logger.info(f"📩 ManyChat ирсэн мессеж: {user_message[:50]}... (Subscriber: {subscriber_id})")
-        
-        # 1. Google Sheets-ээс өгөгдөл татах
-        all_courses = []
-        all_faqs = []
-        
+
+        all_courses, all_faqs = [], []
         if sheets_service:
             all_courses = sheets_service.get_all_courses()
             all_faqs = sheets_service.get_all_faqs()
         else:
             logger.error("❌ Google Sheets сервис ажиллахгүй байна")
-        
-        # 2. Хэрэглэгчийн асуултад тохирох сургалтыг олох
+
         matched_courses = []
-        
-        # Зөвхөн мэдээлэлтэй асуултуудад хайлт хийх
         simple_greetings = ['сайн уу', 'сайн байна уу', 'hello', 'hi', 'сайн', 'байна уу']
-        if user_message.lower() not in simple_greetings:
-            if sheets_service:
-                course = sheets_service.get_course_by_keyword(user_message)
-                if course:
-                    matched_courses = [course]
-        
-        # 3. AI хариулт үүсгэх
+        if user_message.lower() not in simple_greetings and sheets_service:
+            course = sheets_service.get_course_by_keyword(user_message)
+            if course:
+                matched_courses = [course]
+
         context_data = {
             "courses": matched_courses if matched_courses else all_courses[:4],
             "faqs": all_faqs[:5]
         }
-        
-        ai_response = ""
+
         if ai_service:
             ai_response = ai_service.generate_response(user_message, context_data)
         else:
             ai_response = "Уучлаарай, AI сервис ажиллахгүй байна. Та 91117577 дугаарт залгана уу."
-        
-        # 4. ManyChat руу илгээх (сонголттой)
-        if app.config['MANYCHAT_TOKEN'] and manychat_service:
-            manychat_response = manychat_service.send_message(subscriber_id, ai_response)
-        
-        # 5. ManyChat-д шаардлагатай формат буцаах
+
+        # ✅ FIX: ManyChat sendContent API-р давхар илгээхийг БҮРЭН зогсоов.
+        # Учир нь ManyChat External Request нь webhook-ийн response-ийг өөрөө ашиглаж/харуулдаг.
+        # manychat_service.send_message(subscriber_id, ai_response)
+
+        # ✅ FIX: ManyChat-ийн "Response mapping" ашиглаж байсан хувилбар + mapping-гүй хувилбар
+        # хоёуланд нь нийцүүлэхээр 2 wrapper-тэй буцааж байна.
         return jsonify({
+            # mapping ашигладаг бол (өмнөх чинь $.content.messages[0].text)
+            "content": {
+                "messages": [{
+                    "type": "text",
+                    "text": ai_response
+                }]
+            },
+            # mapping ашиглахгүй, шууд response-г уншдаг тохиргоонд
             "messages": [{
                 "type": "text",
                 "text": ai_response
             }]
         })
-        
+
     except Exception as e:
         logger.error(f"❌ Вебхук боловсруулахад алдаа: {e}", exc_info=True)
         return jsonify({
