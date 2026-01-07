@@ -1,418 +1,375 @@
 import os
 import json
 import logging
-import sys
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import lru_cache
 from typing import List, Dict, Any, Optional
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-
+import openai
 import requests
 from dotenv import load_dotenv
 
-# ✅ FIX: TTL cache ашиглах (pip install cachetools)
-from cachetools import TTLCache
-
-# ✅ FIX: OpenAI SDK зөв ашиглалт (pip install openai)
-from openai import OpenAI
-
-# ======================
-# Logging
-# ======================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+# Лог тохируулах
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ======================
-# Env
-# ======================
+# Environment variables ачаалах
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # CORS зөвшөөрөх
 
 # ======================
-# Config
+# Конфигураци
 # ======================
 class Config:
-    SHEET_ID = os.getenv("SHEET_ID", "")
-    GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
-
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-    MANYCHAT_TOKEN = os.getenv("MANYCHAT_TOKEN", "")
-
-    CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # seconds
+    # Google Sheets API тохиргоо
+    SHEET_ID = os.getenv('SHEET_ID', '1HG2o-2oJtYwCWoGQpC3HhC_n6_scR-cPrMB47U9yc90')
+    CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS_JSON', '{}')
+    
+    # OpenAI API
+    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+    OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+    
+    # ManyChat тохиргоо
+    MANYCHAT_TOKEN = os.getenv('MANYCHAT_TOKEN')
+    MANYCHAT_API_URL = "https://api.manychat.com/fb/sending/sendContent"
+    
+    # Кэш хугацаа (секундээр)
+    CACHE_TTL = 300  # 5 минут
 
 app.config.from_object(Config)
-
 
 # ======================
 # Google Sheets Service
 # ======================
 class GoogleSheetsService:
     def __init__(self):
-        self.sheet_id = app.config["SHEET_ID"]
-        self.credentials_json = app.config["GOOGLE_CREDENTIALS_JSON"]
+        self.sheet_id = app.config['SHEET_ID']
         self.service = None
-
-        # ✅ FIX: 5 минут TTL cache (courses, faq гэх мэт)
-        self._cache = TTLCache(maxsize=16, ttl=app.config["CACHE_TTL"])
-
         self._initialize_service()
-
+    
     def _initialize_service(self):
+        """Google Sheets API сервис эхлүүлэх"""
         try:
-            if not self.sheet_id:
-                raise ValueError("SHEET_ID хоосон байна")
-
-            if not self.credentials_json or self.credentials_json.strip() in ("", "{}"):
-                raise ValueError("GOOGLE_CREDENTIALS_JSON хоосон байна")
-
-            credentials_info = json.loads(self.credentials_json)
-
+            credentials_info = json.loads(app.config['CREDENTIALS_JSON'])
             credentials = service_account.Credentials.from_service_account_info(
                 credentials_info,
-                scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+                scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
             )
-
-            self.service = build("sheets", "v4", credentials=credentials)
-            logger.info("✅ Google Sheets API сервис эхэллээ")
-
+            self.service = build('sheets', 'v4', credentials=credentials)
+            logger.info("✅ Google Sheets API сервис эхлэв")
         except Exception as e:
-            logger.error(f"❌ Google Sheets init алдаа: {e}", exc_info=True)
+            logger.error(f"❌ Google Sheets API эхлүүлэхэд алдаа: {e}")
             raise
-
+    
+    @lru_cache(maxsize=1)
+    def get_cached_data(self, sheet_name: str, cache_key: str = ""):
+        """Кэшлэсэн өгөгдөл авах"""
+        return self.get_sheet_data(sheet_name)
+    
     def get_sheet_data(self, sheet_name: str) -> List[Dict[str, Any]]:
-        """Google Sheets-ээс хүснэгт унших (A:Z)"""
+        """Google Sheets-ээс өгөгдөл унших"""
         try:
             sheet = self.service.spreadsheets()
             result = sheet.values().get(
                 spreadsheetId=self.sheet_id,
                 range=f"{sheet_name}!A:Z"
             ).execute()
-
-            values = result.get("values", [])
+            
+            values = result.get('values', [])
             if not values:
                 return []
-
+            
+            # Эхний мөрийг баганы нэр болгох
             headers = values[0]
             data = []
-
+            
             for row in values[1:]:
+                # Мөр бүрийг баганатай нь хослуулах
                 item = {}
                 for i, header in enumerate(headers):
-                    item[header] = row[i] if i < len(row) else ""
-
-                # зөвхөн is_active=True мөрүүд
-                if item.get("is_active", "True").strip().lower() == "true":
+                    if i < len(row):
+                        item[header] = row[i]
+                    else:
+                        item[header] = ""
+                
+                # Зөвхөн идэвхтэй мөрүүдийг нэмэх
+                if item.get('is_active', 'True').strip().lower() == 'true':
                     data.append(item)
-
-            logger.info(f"✅ {sheet_name} хуудсаас {len(data)} мөр уншлаа")
+            
+            logger.info(f"✅ {sheet_name} хуудаснаас {len(data)} мөр уншлаа")
             return data
-
+            
         except Exception as e:
-            logger.error(f"❌ {sheet_name} унших алдаа: {e}", exc_info=True)
+            logger.error(f"❌ {sheet_name} хуудсыг уншихад алдаа: {e}")
             return []
-
-    def get_cached_sheet(self, sheet_name: str) -> List[Dict[str, Any]]:
-        """✅ FIX: TTL cache ашиглан sheet унших"""
-        if sheet_name in self._cache:
-            return self._cache[sheet_name]
-
-        data = self.get_sheet_data(sheet_name)
-        self._cache[sheet_name] = data
-        return data
-
+    
     def get_all_courses(self) -> List[Dict[str, Any]]:
-        courses = self.get_cached_sheet("courses")
-        # priority өсөхөөр эрэмбэлэх
-        def safe_float(x):
-            try:
-                return float(x)
-            except:
-                return 999.0
-        return sorted(courses, key=lambda x: safe_float(x.get("priority", 999)))
-
+        """Бүх сургалтуудыг авах"""
+        courses = self.get_cached_data("courses", "courses_cache")
+        
+        # Priority эрэмбээр жагсаах
+        return sorted(courses, key=lambda x: float(x.get('priority', 999)))
+    
     def get_all_faqs(self) -> List[Dict[str, Any]]:
-        return self.get_cached_sheet("faq")
-
+        """Бүх FAQ-уудыг авах"""
+        return self.get_cached_data("faq", "faq_cache")
+    
     def get_course_by_keyword(self, keyword: str) -> Optional[Dict[str, Any]]:
-        """Түлхүүр үг/нэр/ID-гаар 1 course тааруулах"""
-        if not keyword:
-            return None
-
-        keyword_lower = keyword.strip().lower()
+        """Түлхүүр үгээр сургалт хайх"""
+        keyword_lower = keyword.lower()
         courses = self.get_all_courses()
-
+        
         for course in courses:
-            # keywords column: "a|b|c"
-            keywords = (course.get("keywords", "") or "").strip()
-            if keywords and "|" in keywords:
-                course_keywords = [k.strip().lower() for k in keywords.split("|") if k.strip()]
+            # Түлхүүр үгсээр хайх
+            keywords = course.get('keywords', '')
+            if keywords and '|' in keywords:
+                course_keywords = [k.strip().lower() for k in keywords.split('|')]
                 if any(kw in keyword_lower for kw in course_keywords):
                     return course
-
-            course_name = (course.get("course_name", "") or "").strip().lower()
-            if course_name and keyword_lower in course_name:
+            
+            # Нэрээр хайх
+            course_name = course.get('course_name', '').lower()
+            if keyword_lower in course_name:
                 return course
-
-            course_id = (course.get("course_id", "") or "").strip().lower()
-            if course_id and keyword_lower == course_id:
-                return course
-
+        
         return None
 
-
 # ======================
-# AI Service
+# AI Service (OpenAI)
 # ======================
 class AIService:
     def __init__(self):
-        self.api_key = app.config["OPENAI_API_KEY"]
-        self.model = app.config["OPENAI_MODEL"]
-        self.client = OpenAI(api_key=self.api_key) if self.api_key else None
-
-        if not self.api_key:
-            logger.warning("⚠️ OPENAI_API_KEY тохируулаагүй байна")
-
+        openai.api_key = app.config['OPENAI_API_KEY']
+        self.model = app.config['OPENAI_MODEL']
+        
+        if not openai.api_key:
+            logger.warning("⚠️ OpenAI API Key олдсонгүй!")
+    
     def generate_response(self, user_question: str, context_data: Dict[str, Any]) -> str:
-        if not self.client:
-            return "Уучлаарай, AI сервис түр ажиллахгүй байна. Нэмэлт мэдээлэл авах бол 91117577 дугаарт залгана уу."
-
-        system_prompt = (
-            "Та бол Way Academy-гийн албан ёсны туслах чатбот.\n"
-            "Дараах дүрмийг баримтлаарай:\n"
-            "1) ЗӨВХӨН өгөгдсөн мэдээллээс хариул\n"
-            "2) Монгол хэлээр, найрсаг, товч\n"
-            "3) Үнэ, цаг, багшийн мэдээллийг тодорхой харуул\n"
-            "4) Мэдээлэл олдохгүй бол: \"Уучлаарай, энэ асуултанд хариулж чадахгүй байна\" гэж хэл\n"
-            "5) Сургалтын нэр, ID (SDM, DA гэх мэт)-г зөв хэрэглэ\n"
-            "6) Төгсгөлд: \"Нэмэлт мэдээлэл авах бол 91117577 дугаарт залгана уу\" гэж нэм"
-        )
-
-        context_str = self._format_context(context_data)
-
-        user_prompt = (
-            f"Хэрэглэгчийн асуулт: {user_question}\n\n"
-            "Доорх мэдээллээс хариулт өгнө үү:\n"
-            f"{context_str}\n\n"
-            "Хариулт:"
-        )
-
+        """AI ашиглан хариулт үүсгэх"""
         try:
-            resp = self.client.chat.completions.create(
+            if not openai.api_key:
+                return "Уучлаарай, AI сервис түр ажиллахгүй байна."
+            
+            # Монгол хэл дээрх систем prompt
+            system_prompt = """Та бол Way Academy-гийн албан ёсны туслах чатбот. 
+Дараах дүрмийг баримтлаарай:
+1. ЗӨВХӨН өгөгдсөн мэдээллээс хариулт өгөх
+2. Монгол хэлээр, найрсаг, товч хариулт өгөх
+3. Үнэ, цаг, багшийн мэдээллийг тодорхой харуулах
+4. Хэрэв мэдээлэл олдохгүй бол "Уучлаарай, энэ асуултанд хариулж чадахгүй байна" гэж хэлэх
+5. Сургалтын нэр, ID (SDM, DA гэх мэт) зөв хэрэглэх"""
+            
+            # Context-ыг форматлах
+            context_str = self._format_context(context_data)
+            
+            # Хэрэглэгчийн асуулт
+            user_prompt = f"""Хэрэглэгчийн асуулт: {user_question}
+
+Доорх мэдээллээс хариулт өгнө үү:
+{context_str}
+
+Хариулт:"""
+            
+            # OpenAI API дуудах
+            response = openai.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.3,
-                max_tokens=450
+                temperature=0.7,
+                max_tokens=500
             )
-            text = (resp.choices[0].message.content or "").strip()
-            if not text:
-                return "Уучлаарай, хариулт үүсгэхэд алдаа гарлаа. Нэмэлт мэдээлэл авах бол 91117577 дугаарт залгана уу."
-            return text
-
+            
+            return response.choices[0].message.content.strip()
+            
         except Exception as e:
-            logger.error(f"❌ OpenAI алдаа: {e}", exc_info=True)
-            return self._fallback(user_question, context_data)
-
+            logger.error(f"❌ AI хариулт үүсгэхэд алдаа: {e}")
+            return "Уучлаарай, хариулт үүсгэхэд алдаа гарлаа. Дахин оролдоно уу."
+    
     def _format_context(self, data: Dict[str, Any]) -> str:
-        parts = []
-
-        courses = data.get("courses", [])
-        if courses:
-            parts.append("=== СУРГАЛТУУД ===")
-            for c in courses:
-                parts.append(
-                    "Нэр: {name}\n"
-                    "ID: {cid}\n"
-                    "Тайлбар: {desc}\n"
-                    "Багш: {teacher}\n"
-                    "Хугацаа: {duration}\n"
-                    "Үнэ: {price_full}\n"
-                    "Early Bird: {price_early} ({early_note})\n"
-                    "Цагийн хуваарь: {s1} {s2}\n"
-                    "---".format(
-                        name=c.get("course_name", "Тодорхойгүй"),
-                        cid=c.get("course_id", "Тодорхойгүй"),
-                        desc=(c.get("description", "") or "")[:200] + ("..." if c.get("description") else ""),
-                        teacher=c.get("teacher", "Тодорхойгүй"),
-                        duration=c.get("duration", "Тодорхойгүй"),
-                        price_full=c.get("price_full", "Тодорхойгүй"),
-                        # таны sheet-д price_early_bird/early_bird_note байгаа гэж санаж байна
-                        price_early=c.get("price_early_bird", c.get("price_discount", "Байхгүй")),
-                        early_note=c.get("early_bird_note", c.get("price_discount_until", "")),
-                        s1=c.get("schedule_1", ""),
-                        s2=c.get("schedule_2", "")
-                    )
-                )
-
-        faqs = data.get("faqs", [])
-        if faqs:
-            parts.append("\n=== ТҮГЭЭМЭЛ АСУУЛТУУД ===")
-            for f in faqs:
-                parts.append(
-                    "Түлхүүр: {k}\n"
-                    "Хариулт: {a}\n"
-                    "---".format(
-                        k=f.get("q_keywords", ""),
-                        a=(f.get("answer", "") or "")[:200] + ("..." if f.get("answer") else "")
-                    )
-                )
-
-        parts.append(
-            "\n=== БУСАД МЭДЭЭЛЭЛ ===\n"
-            "Хаяг: Galaxy Tower, 7 давхар, 705 тоот, Махатма Ганди гудамж\n"
-            "Утас: 91117577, 99201187\n"
-            "Имэйл: hello@wayconsulting.io\n"
-            "Академийн онцлог: Салбарын шилдэг багш нар, Бодит төсөл дээр практик, AI-г сургалтад нэвтрүүлсэн"
-        )
-
-        return "\n".join(parts)
-
-    def _fallback(self, user_question: str, context_data: Dict[str, Any]) -> str:
-        # Маш энгийн fallback
-        q = (user_question or "").lower()
-        if "хаяг" in q:
-            return "Манай хаяг: Galaxy Tower, 7 давхар, 705 тоот, Махатма Ганди гудамж. Нэмэлт мэдээлэл авах бол 91117577 дугаарт залгана уу."
-        if "утас" in q or "дугаар" in q:
-            return "Утас: 91117577, 99201187. Нэмэлт мэдээлэл авах бол 91117577 дугаарт залгана уу."
-        return "Уучлаарай, энэ асуултанд хариулж чадахгүй байна. Нэмэлт мэдээлэл авах бол 91117577 дугаарт залгана уу."
-
+        """Өгөгдлийг AI-д ойлгомжтой форматлах"""
+        context_parts = []
+        
+        # Сургалтын мэдээлэл
+        if 'courses' in data and data['courses']:
+            context_parts.append("=== СУРГАЛТУУД ===")
+            for course in data['courses']:
+                context_parts.append(f"""
+Нэр: {course.get('course_name', 'Тодорхойгүй')}
+ID: {course.get('course_id', 'Тодорхойгүй')}
+Тайлбар: {course.get('description', '')[:200]}...
+Багш: {course.get('teacher', 'Тодорхойгүй')}
+Хугацаа: {course.get('duration', 'Тодорхойгүй')}
+Үнэ: {course.get('price_full', 'Тодорхойгүй')}
+Early Bird: {course.get('price_discount', 'Байхгүй')} ({course.get('price_discount_until', '')})
+Цагийн хуваарь: {course.get('schedule_1', '')} {course.get('schedule_2', '')}
+Түлхүүр үгс: {course.get('keywords', '')}
+---""")
+        
+        # FAQ мэдээлэл
+        if 'faqs' in data and data['faqs']:
+            context_parts.append("\n=== ТҮГЭЭМЭЛ АСУУЛТУУД ===")
+            for faq in data['faqs']:
+                context_parts.append(f"""
+Асуулт: {faq.get('q_keywords', '')}
+Хариулт: {faq.get('answer', '')[:150]}...
+---""")
+        
+        # Ерөнхий мэдээлэл
+        context_parts.append("""
+=== БУСАД МЭДЭЭЛЭЛ ===
+Хаяг: Galaxy Tower, 7 давхар, 705 тоот, Махатма Ганди гудамж
+Утас: 91117577, 99201187
+Имэйл: hello@wayconsulting.io
+Академийн онцлог: Салбарын шилдэг багш нар, Бодит төсөл дээр практик, AI-г сургалтад нэвтрүүлсэн""")
+        
+        return "\n".join(context_parts)
 
 # ======================
-# Initialize services
+# ManyChat Service
 # ======================
-try:
-    sheets_service = GoogleSheetsService()
-except Exception:
-    sheets_service = None
+class ManyChatService:
+    @staticmethod
+    def send_message(subscriber_id: str, message: str) -> Dict[str, Any]:
+        """ManyChat руу мессеж илгээх"""
+        try:
+            token = app.config['MANYCHAT_TOKEN']
+            if not token:
+                logger.warning("⚠️ ManyChat Token олдсонгүй!")
+                return {"status": "error", "message": "Token not configured"}
+            
+            payload = {
+                "subscriber_id": subscriber_id,
+                "data": {
+                    "version": "v2",
+                    "content": {
+                        "messages": [{
+                            "type": "text",
+                            "text": message
+                        }]
+                    }
+                }
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+            
+            response = requests.post(
+                app.config['MANYCHAT_API_URL'],
+                json=payload,
+                headers=headers,
+                timeout=10
+            )
+            
+            response.raise_for_status()
+            logger.info(f"✅ ManyChat руу амжилттай илгээлээ")
+            return response.json()
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ ManyChat руу илгээхэд алдаа: {e}")
+            return {"status": "error", "message": str(e)}
 
+# ======================
+# Глобал Service Объектууд
+# ======================
+sheets_service = GoogleSheetsService()
 ai_service = AIService()
-
-
-# ======================
-# Helpers
-# ======================
-def parse_manychat_payload(data: Dict[str, Any]) -> (Optional[str], str):
-    """
-    ManyChat payload олон янзаар ирдэг.
-    subscriber_id + user_message-г аль болох найдвартай гаргаж авна.
-    """
-    subscriber_id = None
-    user_message = ""
-
-    # 1) { subscriber_id, message: "text" }
-    if "subscriber_id" in data:
-        subscriber_id = str(data.get("subscriber_id"))
-        msg = data.get("message", "")
-        user_message = msg.get("text", "") if isinstance(msg, dict) else str(msg or "")
-
-    # 2) { subscriber: {id}, message: {text} }
-    elif "subscriber" in data:
-        sub = data.get("subscriber") or {}
-        subscriber_id = str(sub.get("id")) if sub.get("id") is not None else None
-        msg = data.get("message", {})
-        if isinstance(msg, dict):
-            user_message = msg.get("text", "") or msg.get("message", "") or ""
-        else:
-            user_message = str(msg or "")
-
-    # 3) { data: { subscriber: {id}, message: ... } }
-    elif "data" in data and isinstance(data["data"], dict):
-        inner = data["data"]
-        sub = inner.get("subscriber") or {}
-        subscriber_id = str(sub.get("id")) if sub.get("id") is not None else None
-        msg = inner.get("message", "")
-        user_message = msg.get("text", "") if isinstance(msg, dict) else str(msg or "")
-
-    # fallback
-    if not user_message:
-        user_message = (data.get("text") or data.get("message") or "").strip()
-
-    return subscriber_id, (user_message or "").strip()
-
+manychat_service = ManyChatService()
 
 # ======================
-# Routes
+# Flask Routes
 # ======================
-@app.route("/")
+@app.route('/')
 def index():
+    """Үндсэн хуудас - систем статус харуулах"""
     return jsonify({
         "status": "active",
         "service": "Way Academy Chatbot API",
         "timestamp": datetime.now().isoformat(),
-        "version": "3.0.0",
         "endpoints": {
-            "/health": "health",
-            "/manychat/webhook": "ManyChat webhook",
-            "/test": "local test",
-            "/courses": "list courses",
-            "/faqs": "list faqs"
+            "/health": "Эрүүл мэндийн шалгалт",
+            "/manychat/webhook": "ManyChat вебхук",
+            "/test": "Тестийн endpoint",
+            "/courses": "Бүх сургалтууд",
+            "/faqs": "Бүх FAQ"
         }
     })
 
-
-@app.route("/health", methods=["GET"])
-def health():
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Эрүүл мэндийн шалгалт"""
+    services_status = {
+        "google_sheets": False,
+        "openai": False,
+        "manychat": bool(app.config['MANYCHAT_TOKEN'])
+    }
+    
+    # Google Sheets шалгалт
+    try:
+        test_data = sheets_service.get_all_courses()
+        services_status["google_sheets"] = len(test_data) > 0
+    except:
+        services_status["google_sheets"] = False
+    
+    # OpenAI шалгалт
+    services_status["openai"] = bool(app.config['OPENAI_API_KEY'])
+    
     return jsonify({
-        "status": "healthy",
-        "google_sheets": bool(sheets_service),
-        "openai": bool(app.config["OPENAI_API_KEY"]),
-        "timestamp": datetime.now().isoformat()
+        "status": "healthy" if all(services_status.values()) else "degraded",
+        "timestamp": datetime.now().isoformat(),
+        "services": services_status,
+        "version": "1.0.0"
     })
 
-
-@app.route("/manychat/webhook", methods=["POST"])
+@app.route('/manychat/webhook', methods=['POST'])
 def manychat_webhook():
+    """ManyChat вебхук endpoint"""
     try:
-        data = request.get_json(silent=True) or {}
-        subscriber_id, user_message = parse_manychat_payload(data)
-
-        if not subscriber_id:
-            logger.warning(f"❌ Subscriber ID олдсонгүй. keys={list(data.keys())}")
-            return jsonify({"error": "Subscriber ID олдсонгүй"}), 400
-
-        if not user_message:
-            user_message = "сайн уу"
-
-        logger.info(f"📩 ManyChat message: {user_message[:80]}... (Subscriber: {subscriber_id})")
-
-        # Sheets data
-        all_courses, all_faqs = [], []
-        if sheets_service:
-            all_courses = sheets_service.get_all_courses()
-            all_faqs = sheets_service.get_all_faqs()
-        else:
-            logger.error("❌ Google Sheets сервис ажиллахгүй байна")
-
-        # Match course unless greeting
-        greetings = {"сайн уу", "сайн байна уу", "hello", "hi", "сайн", "байна уу"}
+        data = request.json
+        
+        # Шаардлагатай талбарууд шалгах
+        if not data or 'subscriber_id' not in data or 'message' not in data:
+            return jsonify({"error": "Invalid request format"}), 400
+        
+        subscriber_id = data['subscriber_id']
+        user_message = data['message'].strip()
+        
+        logger.info(f"📩 ManyChat ирсэн мессеж: {user_message[:50]}...")
+        
+        # 1. Google Sheets-ээс өгөгдөл татах
+        all_courses = sheets_service.get_all_courses()
+        all_faqs = sheets_service.get_all_faqs()
+        
+        # 2. Хэрэглэгчийн асуултад тохирох сургалтыг олох
         matched_courses = []
-        if user_message.strip().lower() not in greetings and sheets_service:
+        if user_message:
             course = sheets_service.get_course_by_keyword(user_message)
             if course:
                 matched_courses = [course]
-
+        
+        # 3. AI хариулт үүсгэх
         context_data = {
             "courses": matched_courses if matched_courses else all_courses[:4],
             "faqs": all_faqs[:5]
         }
-
+        
         ai_response = ai_service.generate_response(user_message, context_data)
-
-        # ✅ FIX: ManyChat External Request + Response mapping-т зориулсан ГАНЦ формат
-        # JSONPath: $.content.messages[0].text
+        
+        # 4. ManyChat руу илгээх
+        manychat_response = manychat_service.send_message(subscriber_id, ai_response)
+        
+        # 5. ManyChat-д шаардлагатай формат буцаах
         return jsonify({
             "version": "v2",
             "content": {
@@ -422,98 +379,126 @@ def manychat_webhook():
                 }]
             }
         })
-
+        
     except Exception as e:
-        logger.error(f"❌ Webhook алдаа: {e}", exc_info=True)
+        logger.error(f"❌ Вебхук боловсруулахад алдаа: {e}")
         return jsonify({
             "version": "v2",
             "content": {
                 "messages": [{
                     "type": "text",
-                    "text": "Уучлаарай, техникийн алдаа гарлаа. Нэмэлт мэдээлэл авах бол 91117577 дугаарт залгана уу."
+                    "text": "Уучлаарай, техникийн алдаа гарлаа. Та дахин оролдоно уу эсвэл 91117577 дугаарт залгана уу."
                 }]
             }
         }), 500
 
-
-@app.route("/test", methods=["POST", "GET"])
-def test():
-    if request.method == "POST":
-        payload = request.get_json(silent=True) or {}
-        question = (payload.get("question") or "дижитал маркетинг сургалт").strip()
-
-        courses = sheets_service.get_all_courses() if sheets_service else []
-        faqs = sheets_service.get_all_faqs() if sheets_service else []
-
-        context = {"courses": courses[:2], "faqs": faqs[:2]}
-        answer = ai_service.generate_response(question, context)
-
+@app.route('/test', methods=['GET', 'POST'])
+def test_endpoint():
+    """Тестийн endpoint"""
+    if request.method == 'POST':
+        data = request.json
+        question = data.get('question', 'дижитал маркетинг сургалт')
+        
+        # AI тест
+        courses = sheets_service.get_all_courses()
+        faqs = sheets_service.get_all_faqs()
+        
+        context = {
+            "courses": courses[:2],
+            "faqs": faqs[:2]
+        }
+        
+        response = ai_service.generate_response(question, context)
+        
         return jsonify({
             "question": question,
-            "answer": answer,
+            "ai_response": response,
             "courses_count": len(courses),
             "faqs_count": len(faqs)
         })
-
-    # GET
-    courses = sheets_service.get_all_courses() if sheets_service else []
-    faqs = sheets_service.get_all_faqs() if sheets_service else []
+    
+    # GET хүсэлтэд ерөнхий мэдээлэл харуулах
+    courses = sheets_service.get_all_courses()
+    faqs = sheets_service.get_all_faqs()
+    
     return jsonify({
-        "courses_count": len(courses),
-        "faqs_count": len(faqs),
-        "sample_course": courses[0].get("course_name") if courses else None,
-        "sample_faq": faqs[0].get("q_keywords") if faqs else None
+        "total_courses": len(courses),
+        "total_faqs": len(faqs),
+        "sample_course": courses[0]['course_name'] if courses else None,
+        "sample_faq": faqs[0]['q_keywords'] if faqs else None
     })
 
+@app.route('/courses', methods=['GET'])
+def get_courses():
+    """Бүх сургалтуудыг авах API"""
+    courses = sheets_service.get_all_courses()
+    
+    # Товчлон харуулах
+    simplified = []
+    for course in courses:
+        simplified.append({
+            "id": course.get('course_id'),
+            "name": course.get('course_name'),
+            "teacher": course.get('teacher'),
+            "duration": course.get('duration'),
+            "price": course.get('price_full'),
+            "discount": course.get('price_discount'),
+            "schedule": course.get('schedule_1')
+        })
+    
+    return jsonify({
+        "count": len(courses),
+        "courses": simplified
+    })
 
-@app.route("/courses", methods=["GET"])
-def courses():
-    courses = sheets_service.get_all_courses() if sheets_service else []
-    simplified = [{
-        "id": c.get("course_id"),
-        "name": c.get("course_name"),
-        "teacher": c.get("teacher"),
-        "duration": c.get("duration"),
-        "price_full": c.get("price_full"),
-        "price_early_bird": c.get("price_early_bird"),
-        "early_bird_note": c.get("early_bird_note"),
-        "schedule_1": c.get("schedule_1"),
-    } for c in courses]
-    return jsonify({"count": len(simplified), "courses": simplified})
+@app.route('/faqs', methods=['GET'])
+def get_faqs():
+    """Бүх FAQ-уудыг авах API"""
+    faqs = sheets_service.get_all_faqs()
+    
+    simplified = []
+    for faq in faqs:
+        simplified.append({
+            "id": faq.get('faq_id'),
+            "keywords": faq.get('q_keywords'),
+            "answer_preview": faq.get('answer', '')[:100] + '...'
+        })
+    
+    return jsonify({
+        "count": len(faqs),
+        "faqs": simplified
+    })
 
-
-@app.route("/faqs", methods=["GET"])
-def faqs():
-    faqs_ = sheets_service.get_all_faqs() if sheets_service else []
-    simplified = [{
-        "id": f.get("faq_id"),
-        "q_keywords": f.get("q_keywords"),
-        "answer": f.get("answer"),
-    } for f in faqs_]
-    return jsonify({"count": len(simplified), "faqs": simplified})
-
-
+# ======================
+# Алдааны боловсруулагч
+# ======================
 @app.errorhandler(404)
-def not_found(_):
+def not_found(error):
     return jsonify({"error": "Endpoint олдсонгүй"}), 404
 
-
 @app.errorhandler(500)
-def internal_error(_):
+def internal_error(error):
+    logger.error(f"❌ Server алдаа: {error}")
     return jsonify({"error": "Дотоод серверийн алдаа"}), 500
 
-
-if __name__ == "__main__":
-    # ✅ FIX: production дээр заавал байх env-үүд
-    required = ["SHEET_ID", "GOOGLE_CREDENTIALS_JSON"]
-    missing = [k for k in required if not os.getenv(k)]
+# ======================
+# Үндсэн функц
+# ======================
+if __name__ == '__main__':
+    # Шаардлагатай тохиргоог шалгах
+    required_envs = ['SHEET_ID', 'OPENAI_API_KEY', 'GOOGLE_CREDENTIALS_JSON']
+    missing = [env for env in required_envs if not os.getenv(env)]
+    
     if missing:
-        logger.error(f"❌ Дараах env дутуу байна: {missing}")
-        # Railway дээр унах нь зөв (алдаатай ажиллуулахгүй)
-        sys.exit(1)
-
-    port = int(os.getenv("PORT", "5000"))
-    debug_mode = os.getenv("FLASK_DEBUG", "False").lower() == "true"
-
-    logger.info(f"🚀 Server starting on :{port} (debug={debug_mode})")
-    app.run(host="0.0.0.0", port=port, debug=debug_mode, use_reloader=False)
+        logger.warning(f"⚠️ Дараах environment variable дутуу байна: {missing}")
+        logger.warning("Үйлчилгээ дутуу тохиргоотойгоор эхлэв...")
+    
+    # Flask сервер эхлүүлэх
+    port = int(os.getenv('PORT', 5000))
+    debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    
+    logger.info(f"🚀 Way Academy Chatbot Server {port} порт дээр эхэллээ...")
+    logger.info(f"📊 Google Sheets ID: {app.config['SHEET_ID']}")
+    logger.info(f"🤖 OpenAI Model: {app.config['OPENAI_MODEL']}")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug_mode) 
