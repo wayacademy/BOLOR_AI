@@ -72,7 +72,7 @@ def is_price_or_payment_question(msg: str) -> bool:
     m = normalize_text(msg)
     return any(re.search(p, m) for p in PRICE_INTENT_PATTERNS)
 
-# “Үнэ?” гэх мэт тодорхойгүй асуултыг илрүүлэх (course mention байхгүй)
+# course mention / hint detection (өөрчлөх боломжтой)
 COURSE_HINT_PATTERNS = [
     r"\bsdm\b", r"\bda\b", r"\bitba\b", r"\bpz\b",
     r"strategic digital marketing", r"data analyst", r"it business analyst", r"project zero",
@@ -81,6 +81,16 @@ COURSE_HINT_PATTERNS = [
 def has_course_hint(msg: str) -> bool:
     m = normalize_text(msg)
     return any(re.search(p, m) for p in COURSE_HINT_PATTERNS)
+
+# Attachment URL (FB/IG CDN, lookaside гэх мэт) шалгах
+def looks_like_attachment_url(msg: str) -> bool:
+    m = normalize_text(msg)
+    if not m:
+        return False
+    return (
+        m.startswith("http://")
+        or m.startswith("https://")
+    )
 
 # ======================
 # Google Sheets Service
@@ -144,7 +154,7 @@ class GoogleSheetsService:
         headers: List[str] = []
         for i, h in enumerate(raw_headers):
             h2 = str(h).strip()
-            headers.append(h2 if h2 else f"col_{i}")  # хоосон header хамгаална
+            headers.append(h2 if h2 else f"col_{i}")
 
         data: List[Dict[str, Any]] = []
         for row in values[1:]:
@@ -154,7 +164,6 @@ class GoogleSheetsService:
 
             is_active = str(item.get("is_active", "True")).strip().lower()
             if is_active in ["true", "yes", "1", "active", ""]:
-                # payment_options: '|' -> newline
                 if "payment_options" in item and "|" in str(item["payment_options"]):
                     item["payment_options"] = str(item["payment_options"]).replace("|", "\n")
                 data.append(item)
@@ -206,7 +215,7 @@ class GoogleSheetsService:
         faqs = self._get_cache("faq_cache") or []
         return sorted(faqs, key=lambda x: safe_float(x.get("priority", 999) or 999, 999.0))
 
-    # -------- Router (RULE #2, #3) --------
+    # -------- Router --------
     def match_best_faq(self, user_message: str) -> Optional[Dict[str, Any]]:
         msg = normalize_text(user_message)
         if not msg:
@@ -231,8 +240,6 @@ class GoogleSheetsService:
                 continue
 
             pr = safe_float(f.get("priority", 999) or 999, 999.0)
-
-            # higher score wins; tie -> higher priority (smaller number) wins
             if score > best_score or (score == best_score and pr < best_priority):
                 best = f
                 best_score = score
@@ -272,9 +279,8 @@ class GoogleSheetsService:
 
         return best
 
-
 # ======================
-# Gemini Service (RULE #2: FACT-only rewrite)
+# Gemini Service (FACT-only rewrite)
 # ======================
 class GeminiService:
     def __init__(self):
@@ -301,7 +307,6 @@ class GeminiService:
 - Хэрэв FACTS-д байхгүй зүйл асуувал “Энэ талаар мэдээлэл алга байна” гэж хэлээд холбоо барих сувгийг өг.
 """
 
-        # Primary model
         try:
             self.model = genai.GenerativeModel(
                 model_name=self.primary_model_name,
@@ -313,7 +318,6 @@ class GeminiService:
         except Exception as e:
             logger.warning(f"⚠️ Primary model init failed ({self.primary_model_name}): {e}")
 
-        # Fallback model
         try:
             self.model = genai.GenerativeModel(
                 model_name=self.fallback_model_name,
@@ -325,16 +329,9 @@ class GeminiService:
             logger.error(f"❌ Fallback model init failed ({self.fallback_model_name}): {e}", exc_info=True)
 
     def rewrite_from_facts(self, user_question: str, intent: str, facts: Dict[str, Any], force_escalation: bool) -> str:
-        """
-        RULE #2, #4, #5-г нэг дор хэрэгжүүлнэ.
-        - Facts-оос гадагш зохиохгүй.
-        - Стандарт формат.
-        - Price/payment үед escalation CTA-г заавал оруулна.
-        """
         contact = "Холбогдох: 91117577, 99201187 | hello@wayconsulting.io"
         location = "Байршил: Galaxy Tower, 7 давхар, 705"
 
-        # AI байхгүй үед аюулгүй fallback
         if not self.model:
             return self._fallback(intent, facts, force_escalation, contact, location)
 
@@ -379,10 +376,11 @@ OUTPUT FORMAT (заавал):
             return self._fallback(intent, facts, force_escalation, contact, location)
 
     def _fallback(self, intent: str, facts: Dict[str, Any], force_escalation: bool, contact: str, location: str) -> str:
-        # “найруулга” AI байхгүй үед минимал хэлбэрээр
         bullets = []
         for k in ["course_name", "duration", "schedule_1", "schedule_2", "teacher", "price_full", "price_discount", "payment_options"]:
-            v = (facts.get(k) or "").strip() if isinstance(facts.get(k), str) else facts.get(k)
+            v = facts.get(k)
+            if isinstance(v, str):
+                v = v.strip()
             if v:
                 bullets.append(f"• {k}: {v}")
             if len(bullets) >= 4:
@@ -399,7 +397,6 @@ OUTPUT FORMAT (заавал):
             cta = "Яг тохирох нөхцөл, суудал баталгаажуулахын тулд 91117577, 99201187 эсвэл hello@wayconsulting.io-р холбогдоорой."
 
         return f"{main}\n" + ("\n".join(bullets) + "\n" if bullets else "") + f"{cta}\n{contact} | {location}"
-
 
 # ======================
 # Instances
@@ -420,7 +417,12 @@ def programs_list_fact(courses: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     return items
 
 def clarify_for_course() -> str:
-    return "Аль хөтөлбөрийн талаар асууж байна вэ? (SDM / DA / ITBA / Project Zero)"
+    # Товчлол ашиглахгүйгээр ойлгомжтойгоор асууж байна (user request)
+    return "Та аль хөтөлбөрийн талаар асууж байна вэ? (Стратегийн Дижитал Маркетер / Data Analyst / IT Business Analyst / Project Zero)"
+
+def ask_text_instructions() -> str:
+    # Жишээ дээр товчлол ашиглахгүй
+    return "Та асуултаа текстээр бичээд явуулна уу. (Ж: “Стратегийн Дижитал Маркетер хөтөлбөрийн үнэ хэд вэ?”)"
 
 # ======================
 # Routes
@@ -443,7 +445,9 @@ def health():
 @app.route("/manychat/webhook", methods=["POST"])
 def manychat_webhook():
     """
-    RULE #7: Webhook зөвхөн 1 JSON response.
+    ManyChat External Request Best Practice:
+    - External Request never displays response automatically.
+    - We must return simple JSON for Response Mapping, e.g. {"reply": "..."}.
     """
     try:
         if not request.is_json:
@@ -458,34 +462,30 @@ def manychat_webhook():
 
         logger.info(f"📩 Webhook: {subscriber_id} -> {user_message}")
 
-        # Empty message => 1 чиглүүлэх асуулт
-        if not user_message:
-            return jsonify({
-                "version": "v2",
-                "content": {"messages": [{"type": "text", "text": "Та аль хөтөлбөр сонирхож байна вэ? (SDM / DA / ITBA / Project Zero)"}]}
-            })
+        # 1) Empty message guardrail
+        if not user_message or not user_message.strip():
+            return jsonify({"reply": ask_text_instructions()})
 
-        # Load data
+        # 2) Attachment URL guardrail
+        if looks_like_attachment_url(user_message):
+            return jsonify({"reply": ask_text_instructions()})
+
+        # Load data (cached)
         faqs = sheets_service.get_all_faqs()
         courses = sheets_service.get_all_courses()
 
-        # RULE #3: clarify gate (үнэ/төлбөр асуусан ч course тодорхойгүй)
+        # Clarify gate: price/payment asked but course not specified
         if is_price_or_payment_question(user_message) and not has_course_hint(user_message):
-            return jsonify({
-                "version": "v2",
-                "content": {"messages": [{"type": "text", "text": clarify_for_course()}]}
-            })
+            return jsonify({"reply": clarify_for_course()})
 
         # Router: best FAQ or best COURSE
         best_faq = sheets_service.match_best_faq(user_message)
         best_course = sheets_service.match_best_course(user_message)
 
-        # Decide intent (single intent)
         chosen_intent = None
         chosen_obj = None
 
         if best_faq and best_course:
-            # tie-break using priority (smaller wins)
             faq_pr = safe_float(best_faq.get("priority", 999) or 999, 999.0)
             crs_pr = safe_float(best_course.get("priority", 999) or 999, 999.0)
             chosen_intent, chosen_obj = ("FAQ", best_faq) if faq_pr <= crs_pr else ("COURSE", best_course)
@@ -496,10 +496,10 @@ def manychat_webhook():
         else:
             chosen_intent, chosen_obj = "FALLBACK", None
 
-        # Escalation gate (RULE #5)
-        force_escalation = is_price_or_payment_question(user_message)
+        # Escalation gate: price/payment only when we actually respond with info
+        force_escalation = is_price_or_payment_question(user_message) and chosen_intent in ["FAQ", "COURSE"]
 
-        # Build facts (RULE #2)
+        # Build facts
         if chosen_intent == "FAQ":
             facts = {
                 "faq_id": chosen_obj.get("faq_id"),
@@ -509,7 +509,6 @@ def manychat_webhook():
                 "contact_email": "hello@wayconsulting.io",
                 "location": "Galaxy Tower, 7 давхар, 705"
             }
-            # Programs FAQ дээр жагсаалт FACT нэмнэ (найруулга сайжирна)
             if normalize_text(chosen_obj.get("faq_id", "")) == "faq_programs":
                 facts["programs"] = programs_list_fact(courses)
 
@@ -549,7 +548,6 @@ def manychat_webhook():
             )
 
         else:
-            # FALLBACK (RULE #6)
             facts = {
                 "programs": programs_list_fact(courses),
                 "contact_phone": "91117577, 99201187",
@@ -563,28 +561,26 @@ def manychat_webhook():
                 force_escalation=False
             )
 
-        return jsonify({
-            "version": "v2",
-            "content": {"messages": [{"type": "text", "text": text}]}
-        })
+        # IMPORTANT: Return only {"reply": "..."} for ManyChat External Request
+        return jsonify({"reply": text})
 
     except Exception as e:
         logger.error(f"❌ Webhook Error: {e}", exc_info=True)
-        return jsonify({
-            "version": "v2",
-            "content": {"messages": [{"type": "text", "text": "Уучлаарай, системд алдаа гарлаа."}]}
-        }), 200
-
+        return jsonify({"reply": "Уучлаарай, системд алдаа гарлаа. Дахин оролдоно уу."}), 200
 
 @app.route("/test", methods=["POST"])
 def test_endpoint():
     data = request.json or {}
-    q = data.get("question", "").strip() or "SDM үнэ хэд вэ?"
+    q = (data.get("question") or "").strip() or "Стратегийн Дижитал Маркетер хөтөлбөрийн үнэ хэд вэ?"
 
-    faqs = sheets_service.get_all_faqs()
     courses = sheets_service.get_all_courses()
 
-    # mimic webhook logic quickly
+    if not q:
+        return jsonify({"question": q, "route": "EMPTY", "response": ask_text_instructions()})
+
+    if looks_like_attachment_url(q):
+        return jsonify({"question": q, "route": "ATTACHMENT", "response": ask_text_instructions()})
+
     if is_price_or_payment_question(q) and not has_course_hint(q):
         return jsonify({"question": q, "route": "CLARIFY", "response": clarify_for_course()})
 
@@ -602,7 +598,7 @@ def test_endpoint():
     elif best_course:
         chosen_intent, chosen_obj = "COURSE", best_course
 
-    force_escalation = is_price_or_payment_question(q)
+    force_escalation = is_price_or_payment_question(q) and chosen_intent in ["FAQ", "COURSE"]
 
     if chosen_intent == "FAQ":
         facts = {"faq_id": chosen_obj.get("faq_id"), "answer": chosen_obj.get("answer")}
@@ -629,7 +625,6 @@ def test_endpoint():
         resp = ai_service.rewrite_from_facts(q, "FALLBACK", facts, False)
 
     return jsonify({"question": q, "route": chosen_intent, "response": resp, "gemini_model": ai_service.model_name})
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
