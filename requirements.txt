@@ -8,3 +8,4 @@ google-auth-oauthlib==1.2.1
 requests==2.32.3
 gunicorn==22.0.0
 openai==1.51.2
+flask-limiter
