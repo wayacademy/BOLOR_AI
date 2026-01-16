@@ -1,11 +1,7 @@
-Flask==3.0.3
+flask==3.0.3
 flask-cors==4.0.1
-python-dotenv==1.0.1
-google-api-python-client==2.141.0
+google-api-python-client==2.137.0
 google-auth==2.33.0
-google-auth-httplib2==0.2.0
-google-auth-oauthlib==1.2.1
-requests==2.32.3
+cachetools==5.5.0
+openai==1.40.6
 gunicorn==22.0.0
-openai==1.51.2
-flask-limiter
