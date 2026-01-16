@@ -3,17 +3,17 @@ import json
 import time
 import logging
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-
 from cachetools import TTLCache
 
 from openai import OpenAI
+from openai import APIError, RateLimitError, APITimeoutError
 
 
 # ======================
@@ -21,7 +21,7 @@ from openai import OpenAI
 # ======================
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("way-bot")
 
@@ -35,24 +35,30 @@ class Config:
     FLASK_DEBUG = os.getenv("FLASK_DEBUG", "false").lower() == "true"
 
     # Google Sheets
-    SHEET_ID = os.getenv("SHEET_ID")
-    GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    SHEET_ID = os.getenv("SHEET_ID", "").strip()
+    GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 
     # Cache
     CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # seconds
 
     # OpenAI
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-    # Safety/time budget (ManyChat external request ~10s)
-    # We keep our own budget slightly lower.
+    # ManyChat time budget (~10s). Keep our budget lower.
     TIME_BUDGET_SEC = float(os.getenv("TIME_BUDGET_SEC", "8.5"))
 
-    # Response limits
+    # Context limits
     MAX_COURSES_IN_CONTEXT = int(os.getenv("MAX_COURSES_IN_CONTEXT", "3"))
     MAX_FAQS_IN_CONTEXT = int(os.getenv("MAX_FAQS_IN_CONTEXT", "5"))
     MAX_DESC_CHARS = int(os.getenv("MAX_DESC_CHARS", "260"))
+
+    # Dedup (idempotency)
+    DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "3"))
+    DEDUP_MAXSIZE = int(os.getenv("DEDUP_MAXSIZE", "5000"))
+
+    # Template response limits
+    MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "1200"))
 
 
 # ======================
@@ -70,19 +76,51 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def manychat_text(text: str):
-    """Dynamic Block (v2) response."""
-    return jsonify({
-        "version": "v2",
-        "content": {
-            "messages": [{"type": "text", "text": text}]
-        }
-    })
-
-
 def clamp(s: str, n: int) -> str:
     s = s or ""
     return s if len(s) <= n else s[:n].rstrip() + "..."
+
+
+def manychat_v2(text: str):
+    """Dynamic Block (v2) response."""
+    # ManyChat sometimes displays URLs better than markdown; keep plain text.
+    text = (text or "").strip()
+    if len(text) > app.config["MAX_TEXT_CHARS"]:
+        text = text[: app.config["MAX_TEXT_CHARS"]].rstrip() + "..."
+    return jsonify(
+        {
+            "version": "v2",
+            "content": {"messages": [{"type": "text", "text": text}]},
+        }
+    )
+
+
+def manychat_empty():
+    """Return nothing (used for dedup)."""
+    return jsonify({"version": "v2", "content": {"messages": []}})
+
+
+def safe_json() -> Dict[str, Any]:
+    return request.get_json(silent=True) or {}
+
+
+def extract_manychat_fields(payload: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    """
+    External Request (Dynamic Block) body should send:
+      subscriber_id, message
+    But we defensively check a few alternatives.
+    """
+    subscriber_id = payload.get("subscriber_id") or payload.get("contact_id") or payload.get("subscriberId")
+    msg = payload.get("message") or payload.get("last_text_input") or payload.get("last_input_text") or ""
+    if not isinstance(msg, str):
+        msg = str(msg)
+    return (str(subscriber_id).strip() if subscriber_id else None), msg.strip()
+
+
+# ======================
+# Dedup cache (idempotency)
+# ======================
+dedup_cache = TTLCache(maxsize=app.config["DEDUP_MAXSIZE"], ttl=app.config["DEDUP_TTL_SEC"])
 
 
 # ======================
@@ -94,12 +132,13 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 class GoogleSheetsService:
     def __init__(self, sheet_id: str, credentials_json_str: str, cache_ttl: int = 300):
         self.sheet_id = sheet_id
-        self.cache = TTLCache(maxsize=16, ttl=cache_ttl)
+        self.cache = TTLCache(maxsize=32, ttl=cache_ttl)
         self.service = self._init_service(credentials_json_str)
 
     def _init_service(self, credentials_json_str: str):
         info = json.loads(credentials_json_str)
         creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        # cache_discovery=False speeds startup and avoids file writes on some hosts
         svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
         logger.info("✅ Google Sheets API initialized")
         return svc
@@ -118,7 +157,13 @@ class GoogleSheetsService:
         if cache_key in self.cache:
             return self.cache[cache_key]
 
-        values = self._read_values(sheet_name)
+        try:
+            values = self._read_values(sheet_name)
+        except Exception as e:
+            logger.exception(f"❌ Sheets read error ({sheet_name}): {e}")
+            self.cache[cache_key] = []
+            return []
+
         if not values:
             self.cache[cache_key] = []
             return []
@@ -128,13 +173,9 @@ class GoogleSheetsService:
 
         for row in values[1:]:
             item = {h: (row[i] if i < len(row) else "") for i, h in enumerate(headers)}
-
-            # Filter is_active if present
             is_active = str(item.get("is_active", "True")).strip().lower() == "true"
-            if not is_active:
-                continue
-
-            out.append(item)
+            if is_active:
+                out.append(item)
 
         self.cache[cache_key] = out
         logger.info(f"✅ Loaded {len(out)} rows from '{sheet_name}' (cached)")
@@ -160,7 +201,9 @@ class GoogleSheetsService:
         if not t:
             return None
 
-        for c in self.get_all_courses():
+        courses = self.get_all_courses()
+
+        for c in courses:
             kw = (c.get("keywords") or "").lower()
             if kw:
                 kws = [k.strip() for k in kw.split("|") if k.strip()]
@@ -178,11 +221,11 @@ class GoogleSheetsService:
 # AI Service (OpenAI)
 # ======================
 class AIService:
-    def __init__(self, api_key: Optional[str], model: str):
+    def __init__(self, api_key: str, model: str):
         self.model = model
         self.client = OpenAI(api_key=api_key) if api_key else None
         if not api_key:
-            logger.warning("⚠️ OPENAI_API_KEY missing; AI will be disabled")
+            logger.warning("⚠️ OPENAI_API_KEY missing; AI disabled")
 
     def build_system_prompt(self) -> str:
         return (
@@ -191,7 +234,8 @@ class AIService:
             "1) ЗӨВХӨН өгөгдсөн контекстээс хариул.\n"
             "2) Монгол хэлээр, товч, ойлгомжтой бич.\n"
             "3) Үнэ, хугацаа, хуваарь, төлбөрийн нөхцөлийг тодорхой харуул.\n"
-            "4) Хэрэв контекстэд байхгүй бол: 'Уучлаарай, энэ асуултад одоогоор тодорхой хариулт олдсонгүй.' гэж хэл.\n"
+            "4) Контекстэд байхгүй бол: 'Уучлаарай, энэ асуултад одоогоор тодорхой хариулт олдсонгүй.' гэж хэл.\n"
+            "5) Линк байвал Markdown биш, URL-ийг бүтнээр нь бич.\n"
         )
 
     def format_context(self, courses: List[Dict[str, Any]], faqs: List[Dict[str, Any]]) -> str:
@@ -201,34 +245,38 @@ class AIService:
             parts.append("=== COURSES ===")
             for c in courses:
                 parts.append(
-                    "\n".join([
-                        f"course_id: {c.get('course_id','')}",
-                        f"course_name: {c.get('course_name','')}",
-                        f"teacher: {c.get('teacher','')}",
-                        f"duration: {c.get('duration','')}",
-                        f"schedule_1: {c.get('schedule_1','')}",
-                        f"schedule_2: {c.get('schedule_2','')}",
-                        f"price_full: {c.get('price_full','')}",
-                        f"price_discount: {c.get('price_discount','')}",
-                        f"price_discount_until: {c.get('price_discount_until','')}",
-                        f"payment_options: {c.get('payment_options','')}",
-                        f"application_link: {c.get('application_link','')}",
-                        f"cta_caption: {c.get('cta_caption','')}",
-                        f"description: {clamp(c.get('description',''), app.config['MAX_DESC_CHARS'])}",
-                        "---"
-                    ])
+                    "\n".join(
+                        [
+                            f"course_id: {c.get('course_id','')}",
+                            f"course_name: {c.get('course_name','')}",
+                            f"teacher: {c.get('teacher','')}",
+                            f"duration: {c.get('duration','')}",
+                            f"schedule_1: {c.get('schedule_1','')}",
+                            f"schedule_2: {c.get('schedule_2','')}",
+                            f"price_full: {c.get('price_full','')}",
+                            f"price_discount: {c.get('price_discount','')}",
+                            f"price_discount_until: {c.get('price_discount_until','')}",
+                            f"payment_options: {c.get('payment_options','')}",
+                            f"application_link: {c.get('application_link','')}",
+                            f"cta_caption: {c.get('cta_caption','')}",
+                            f"description: {clamp(c.get('description',''), app.config['MAX_DESC_CHARS'])}",
+                            "---",
+                        ]
+                    )
                 )
 
         if faqs:
             parts.append("\n=== FAQ ===")
             for f in faqs:
                 parts.append(
-                    "\n".join([
-                        f"faq_id: {f.get('faq_id','')}",
-                        f"q_keywords: {f.get('q_keywords','')}",
-                        f"answer: {clamp(f.get('answer',''), 240)}",
-                        "---"
-                    ])
+                    "\n".join(
+                        [
+                            f"faq_id: {f.get('faq_id','')}",
+                            f"q_keywords: {f.get('q_keywords','')}",
+                            f"answer: {clamp(f.get('answer',''), 240)}",
+                            "---",
+                        ]
+                    )
                 )
 
         parts.append(
@@ -240,54 +288,86 @@ class AIService:
 
         return "\n".join(parts)
 
-    def generate(self, question: str, context: str, time_budget_sec: float) -> str:
+    def generate(self, question: str, context: str) -> str:
         if not self.client:
             return "Уучлаарай, AI сервис түр ажиллахгүй байна."
 
-        sys_prompt = self.build_system_prompt()
-        user_prompt = (
-            f"Хэрэглэгчийн асуулт: {question}\n\n"
-            f"Доорх контекстээс хариул:\n{context}\n\n"
-            "Хариулт:"
-        )
-
-        # Hard cap tokens to keep latency low
-        max_tokens = 450
-
-        # NOTE: Python SDK doesn't support per-request server-side timeout uniformly.
-        # We rely on overall endpoint budget + small context.
         resp = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": self.build_system_prompt()},
+                {"role": "user", "content": f"Хэрэглэгчийн асуулт: {question}\n\nДоорх контекстээс хариул:\n{context}\n\nХариулт:"},
             ],
-            temperature=0.4,
-            max_tokens=max_tokens,
+            temperature=0.35,
+            max_tokens=420,
         )
         return (resp.choices[0].message.content or "").strip()
 
 
 # ======================
-# Init services (fail-fast for required env)
+# Init services
 # ======================
-missing = []
-for k in ["SHEET_ID", "GOOGLE_CREDENTIALS_JSON"]:
-    if not app.config.get(k):
-        missing.append(k)
-
-if missing:
-    logger.warning(f"⚠️ Missing env vars: {missing} (Sheets features may fail)")
-
 sheets_service: Optional[GoogleSheetsService] = None
-if app.config.get("SHEET_ID") and app.config.get("GOOGLE_CREDENTIALS_JSON"):
-    sheets_service = GoogleSheetsService(
-        sheet_id=app.config["SHEET_ID"],
-        credentials_json_str=app.config["GOOGLE_CREDENTIALS_JSON"],
-        cache_ttl=app.config["CACHE_TTL"],
-    )
+if app.config["SHEET_ID"] and app.config["GOOGLE_CREDENTIALS_JSON"]:
+    try:
+        sheets_service = GoogleSheetsService(
+            sheet_id=app.config["SHEET_ID"],
+            credentials_json_str=app.config["GOOGLE_CREDENTIALS_JSON"],
+            cache_ttl=app.config["CACHE_TTL"],
+        )
+    except Exception as e:
+        logger.exception(f"❌ Failed to init Sheets: {e}")
+        sheets_service = None
+else:
+    logger.warning("⚠️ SHEET_ID / GOOGLE_CREDENTIALS_JSON missing")
 
-ai_service = AIService(api_key=app.config.get("OPENAI_API_KEY"), model=app.config["OPENAI_MODEL"])
+ai_service = AIService(api_key=app.config["OPENAI_API_KEY"], model=app.config["OPENAI_MODEL"])
+
+
+# ======================
+# Fast template response (no AI) for matched course
+# ======================
+def format_course_template(c: Dict[str, Any]) -> str:
+    name = c.get("course_name", "Тодорхойгүй")
+    price_full = c.get("price_full", "")
+    price_disc = c.get("price_discount", "")
+    disc_until = c.get("price_discount_until", "")
+    duration = c.get("duration", "")
+    teacher = c.get("teacher", "")
+    s1 = c.get("schedule_1", "")
+    s2 = c.get("schedule_2", "")
+    pay = c.get("payment_options", "")
+    link = c.get("application_link", "")
+    cta = c.get("cta_caption", "")
+
+    lines = [
+        f"{name}",
+        f"Үнэ: {price_full}" if price_full else "Үнэ: (мэдээлэл алга)",
+    ]
+    if price_disc:
+        extra = f"Early Bird: {price_disc}"
+        if disc_until:
+            extra += f" (Хугацаа: {disc_until})"
+        lines.append(extra)
+
+    if duration:
+        lines.append(f"Хугацаа: {duration}")
+    if teacher:
+        lines.append(f"Багш: {teacher}")
+    if s1 or s2:
+        lines.append("Цагийн хуваарь:")
+        if s1:
+            lines.append(f"- {s1}")
+        if s2:
+            lines.append(f"- {s2}")
+    if pay:
+        lines.append(f"Төлбөрийн нөхцөл: {pay}")
+    if link:
+        lines.append(f"Бүртгүүлэх: {link}")
+    if cta:
+        lines.append(cta)
+
+    return "\n".join([ln for ln in lines if ln and ln.strip()])
 
 
 # ======================
@@ -295,85 +375,102 @@ ai_service = AIService(api_key=app.config.get("OPENAI_API_KEY"), model=app.confi
 # ======================
 @app.get("/")
 def index():
-    return jsonify({
-        "status": "active",
-        "service": "Way Academy Chatbot API",
-        "timestamp": now_iso(),
-        "endpoints": {
-            "/health": "Health check",
-            "/manychat/webhook": "ManyChat Dynamic Block webhook (POST)",
-            "/courses": "List courses (GET)",
-            "/faqs": "List faqs (GET)",
+    return jsonify(
+        {
+            "status": "active",
+            "service": "Way Academy Chatbot API",
+            "timestamp": now_iso(),
+            "endpoints": {
+                "/health": "Health check",
+                "/manychat/webhook": "ManyChat Dynamic Block webhook (POST)",
+                "/courses": "List courses (GET)",
+                "/faqs": "List faqs (GET)",
+            },
         }
-    })
+    )
 
 
 @app.get("/health")
 def health():
-    status = {
+    services = {
         "google_sheets": bool(sheets_service),
-        "openai": bool(app.config.get("OPENAI_API_KEY")),
+        "openai": bool(app.config["OPENAI_API_KEY"]),
         "cache_ttl": app.config["CACHE_TTL"],
         "model": app.config["OPENAI_MODEL"],
         "timestamp": now_iso(),
-        "version": "1.0.0",
+        "version": "1.1.0",
+        "dedup_ttl": app.config["DEDUP_TTL_SEC"],
     }
-    overall = "healthy" if status["google_sheets"] else "degraded"
-    return jsonify({"status": overall, "services": status})
+    overall = "healthy" if services["google_sheets"] else "degraded"
+    return jsonify({"status": overall, "services": services})
 
 
 @app.post("/manychat/webhook")
 def manychat_webhook():
     start = time.time()
+    payload = safe_json()
+    subscriber_id, message = extract_manychat_fields(payload)
 
-    data = request.get_json(silent=True) or {}
-    subscriber_id = data.get("subscriber_id")
-    message = (data.get("message") or "").strip()
+    # Log what we receive (for debugging stale input)
+    logger.info(f"[MC] subscriber_id={subscriber_id} message={message!r}")
 
-    # Basic validation (ManyChat Dynamic Block)
-    if not subscriber_id or not isinstance(message, str) or not message:
-        return manychat_text("Уучлаарай, таны мессежийг уншиж чадсангүй. Дахин бичнэ үү."), 200
+    # Validate
+    if not subscriber_id or not message:
+        return manychat_v2("Уучлаарай, таны мессежийг уншиж чадсангүй. Дахин бичнэ үү."), 200
+
+    # Dedup / idempotency (prevents repeated replies if user double-sends or platform retries)
+    dkey = f"{subscriber_id}:{message}"
+    if dkey in dedup_cache:
+        logger.info(f"[MC] dedup hit for {dkey}")
+        return manychat_empty(), 200
+    dedup_cache[dkey] = True
 
     # Time budget guard
     budget = app.config["TIME_BUDGET_SEC"]
 
-    try:
-        if not sheets_service:
-            return manychat_text("Уучлаарай, одоогоор мэдээллийн сан холбогдоогүй байна."), 200
+    if not sheets_service:
+        return manychat_v2("Уучлаарай, одоогоор мэдээллийн сан холбогдоогүй байна."), 200
 
-        # 1) Pull data (cached)
+    try:
+        # Pull cached data
         all_courses = sheets_service.get_all_courses()
         all_faqs = sheets_service.get_all_faqs()
 
-        # 2) Match course (optional)
+        # Fast path: matched course -> template response (no AI, very fast)
         matched = sheets_service.get_course_by_keyword(message)
-        courses_for_ctx: List[Dict[str, Any]] = []
         if matched:
-            courses_for_ctx = [matched]
-        else:
-            # Keep context small for speed
-            courses_for_ctx = all_courses[: app.config["MAX_COURSES_IN_CONTEXT"]]
+            return manychat_v2(format_course_template(matched)), 200
 
+        # If budget already consumed (rare), bail out
+        if (time.time() - start) > budget:
+            return manychat_v2("Уучлаарай, систем ачаалалтай байна. Дахин оролдоно уу."), 200
+
+        # Keep context small for speed
+        courses_for_ctx = all_courses[: app.config["MAX_COURSES_IN_CONTEXT"]]
         faqs_for_ctx = all_faqs[: app.config["MAX_FAQS_IN_CONTEXT"]]
-
-        # 3) Build context (small)
         context = ai_service.format_context(courses_for_ctx, faqs_for_ctx)
 
-        # 4) Generate AI response if time left
-        elapsed = time.time() - start
-        if elapsed > budget:
-            return manychat_text("Уучлаарай, систем ачаалалтай байна. Дахин оролдоно уу."), 200
+        # AI generate (graceful fallbacks)
+        try:
+            answer = ai_service.generate(message, context)
+        except (RateLimitError, APITimeoutError) as e:
+            logger.warning(f"OpenAI transient error: {e}")
+            answer = "Уучлаарай, одоогоор систем ачаалалтай байна. Дахин оролдоно уу."
+        except APIError as e:
+            logger.warning(f"OpenAI API error: {e}")
+            answer = "Уучлаарай, одоогоор хариу үүсгэхэд асуудал гарлаа. Дахин оролдоно уу."
+        except Exception as e:
+            logger.exception(f"OpenAI unknown error: {e}")
+            answer = "Уучлаарай, техникийн алдаа гарлаа. Та дахин оролдоно уу."
 
-        answer = ai_service.generate(message, context, budget - elapsed)
         if not answer:
             answer = "Уучлаарай, энэ асуултад одоогоор тодорхой хариулт олдсонгүй."
 
-        # 5) Return Dynamic Block response
-        return manychat_text(answer), 200
+        return manychat_v2(answer), 200
 
     except Exception as e:
         logger.exception(f"❌ webhook error: {e}")
-        return manychat_text("Уучлаарай, техникийн алдаа гарлаа. Та дахин оролдоно уу."), 200
+        return manychat_v2("Уучлаарай, техникийн алдаа гарлаа. Та дахин оролдоно уу."), 200
 
 
 @app.get("/courses")
@@ -382,18 +479,20 @@ def courses():
         return jsonify({"count": 0, "courses": [], "error": "Sheets not configured"}), 200
 
     courses_data = sheets_service.get_all_courses()
-    simplified = [{
-        "course_id": c.get("course_id"),
-        "course_name": c.get("course_name"),
-        "teacher": c.get("teacher"),
-        "duration": c.get("duration"),
-        "schedule_1": c.get("schedule_1"),
-        "price_full": c.get("price_full"),
-        "price_discount": c.get("price_discount"),
-        "application_link": c.get("application_link"),
-        "priority": c.get("priority"),
-    } for c in courses_data]
-
+    simplified = [
+        {
+            "course_id": c.get("course_id"),
+            "course_name": c.get("course_name"),
+            "teacher": c.get("teacher"),
+            "duration": c.get("duration"),
+            "schedule_1": c.get("schedule_1"),
+            "price_full": c.get("price_full"),
+            "price_discount": c.get("price_discount"),
+            "application_link": c.get("application_link"),
+            "priority": c.get("priority"),
+        }
+        for c in courses_data
+    ]
     return jsonify({"count": len(simplified), "courses": simplified})
 
 
@@ -403,13 +502,15 @@ def faqs():
         return jsonify({"count": 0, "faqs": [], "error": "Sheets not configured"}), 200
 
     faqs_data = sheets_service.get_all_faqs()
-    simplified = [{
-        "faq_id": f.get("faq_id"),
-        "q_keywords": f.get("q_keywords"),
-        "answer": f.get("answer"),
-        "priority": f.get("priority"),
-    } for f in faqs_data]
-
+    simplified = [
+        {
+            "faq_id": f.get("faq_id"),
+            "q_keywords": f.get("q_keywords"),
+            "answer": f.get("answer"),
+            "priority": f.get("priority"),
+        }
+        for f in faqs_data
+    ]
     return jsonify({"count": len(simplified), "faqs": simplified})
 
 
@@ -419,7 +520,7 @@ def not_found(_):
 
 
 # ======================
-# Main
+# Main (local only)
 # ======================
 if __name__ == "__main__":
     logger.info(f"🚀 Starting on :{app.config['PORT']}")
