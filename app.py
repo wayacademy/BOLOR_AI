@@ -410,69 +410,57 @@ def health():
 @app.post("/manychat/webhook")
 def manychat_webhook():
     start = time.time()
-    payload = safe_json()
-    subscriber_id, message = extract_manychat_fields(payload)
 
-    # Log what we receive (for debugging stale input)
+    payload = request.get_json(silent=True) or {}
+    subscriber_id = payload.get("subscriber_id")
+    message = (payload.get("message") or "").strip()
+
     logger.info(f"[MC] subscriber_id={subscriber_id} message={message!r}")
 
     # Validate
     if not subscriber_id or not message:
-        return manychat_v2("Уучлаарай, таны мессежийг уншиж чадсангүй. Дахин бичнэ үү."), 200
+        return jsonify({"ai_response_text": "Уучлаарай, таны мессежийг уншиж чадсангүй. Дахин бичнэ үү."}), 200
 
-    # Dedup / idempotency (prevents repeated replies if user double-sends or platform retries)
-    dkey = f"{subscriber_id}:{message}"
-    if dkey in dedup_cache:
-        logger.info(f"[MC] dedup hit for {dkey}")
-        return manychat_empty(), 200
-    dedup_cache[dkey] = True
-
-    # Time budget guard
-    budget = app.config["TIME_BUDGET_SEC"]
+    # Dedup (optional but recommended)
+    key = f"{subscriber_id}:{message}"
+    if key in dedup_cache:
+        logger.info(f"[MC] dedup hit: {key}")
+        return jsonify({"ai_response_text": ""}), 200
+    dedup_cache[key] = True
 
     if not sheets_service:
-        return manychat_v2("Уучлаарай, одоогоор мэдээллийн сан холбогдоогүй байна."), 200
+        return jsonify({"ai_response_text": "Уучлаарай, одоогоор мэдээллийн сан холбогдоогүй байна."}), 200
 
     try:
-        # Pull cached data
+        # Pull data (cached)
         all_courses = sheets_service.get_all_courses()
         all_faqs = sheets_service.get_all_faqs()
 
-        # Fast path: matched course -> template response (no AI, very fast)
+        # Fast path: course match => template reply (no AI)
         matched = sheets_service.get_course_by_keyword(message)
         if matched:
-            return manychat_v2(format_course_template(matched)), 200
+            text = format_course_template(matched)
+            return jsonify({"ai_response_text": text}), 200
 
-        # If budget already consumed (rare), bail out
-        if (time.time() - start) > budget:
-            return manychat_v2("Уучлаарай, систем ачаалалтай байна. Дахин оролдоно уу."), 200
+        # Time budget guard
+        if (time.time() - start) > app.config["TIME_BUDGET_SEC"]:
+            return jsonify({"ai_response_text": "Уучлаарай, систем ачаалалтай байна. Дахин оролдоно уу."}), 200
 
-        # Keep context small for speed
+        # Small context for AI
         courses_for_ctx = all_courses[: app.config["MAX_COURSES_IN_CONTEXT"]]
         faqs_for_ctx = all_faqs[: app.config["MAX_FAQS_IN_CONTEXT"]]
         context = ai_service.format_context(courses_for_ctx, faqs_for_ctx)
 
-        # AI generate (graceful fallbacks)
-        try:
-            answer = ai_service.generate(message, context)
-        except (RateLimitError, APITimeoutError) as e:
-            logger.warning(f"OpenAI transient error: {e}")
-            answer = "Уучлаарай, одоогоор систем ачаалалтай байна. Дахин оролдоно уу."
-        except APIError as e:
-            logger.warning(f"OpenAI API error: {e}")
-            answer = "Уучлаарай, одоогоор хариу үүсгэхэд асуудал гарлаа. Дахин оролдоно уу."
-        except Exception as e:
-            logger.exception(f"OpenAI unknown error: {e}")
-            answer = "Уучлаарай, техникийн алдаа гарлаа. Та дахин оролдоно уу."
-
+        # AI
+        answer = ai_service.generate(message, context)
         if not answer:
             answer = "Уучлаарай, энэ асуултад одоогоор тодорхой хариулт олдсонгүй."
 
-        return manychat_v2(answer), 200
+        return jsonify({"ai_response_text": answer}), 200
 
     except Exception as e:
         logger.exception(f"❌ webhook error: {e}")
-        return manychat_v2("Уучлаарай, техникийн алдаа гарлаа. Та дахин оролдоно уу."), 200
+        return jsonify({"ai_response_text": "Уучлаарай, техникийн алдаа гарлаа. Та дахин оролдоно уу."}), 200
 
 
 @app.get("/courses")
