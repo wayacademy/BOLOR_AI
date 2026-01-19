@@ -325,6 +325,53 @@ else:
 
 ai_service = AIService(api_key=app.config["OPENAI_API_KEY"], model=app.config["OPENAI_MODEL"])
 
+
+# ======================
+# Fast template response (no AI) for matched course
+# ======================
+def format_course_template(c: Dict[str, Any]) -> str:
+    name = c.get("course_name", "Тодорхойгүй")
+    price_full = c.get("price_full", "")
+    price_disc = c.get("price_discount", "")
+    disc_until = c.get("price_discount_until", "")
+    duration = c.get("duration", "")
+    teacher = c.get("teacher", "")
+    s1 = c.get("schedule_1", "")
+    s2 = c.get("schedule_2", "")
+    pay = c.get("payment_options", "")
+    link = c.get("application_link", "")
+    cta = c.get("cta_caption", "")
+
+    lines = [
+        f"{name}",
+        f"Үнэ: {price_full}" if price_full else "Үнэ: (мэдээлэл алга)",
+    ]
+    if price_disc:
+        extra = f"Early Bird: {price_disc}"
+        if disc_until:
+            extra += f" (Хугацаа: {disc_until})"
+        lines.append(extra)
+
+    if duration:
+        lines.append(f"Хугацаа: {duration}")
+    if teacher:
+        lines.append(f"Багш: {teacher}")
+    if s1 or s2:
+        lines.append("Цагийн хуваарь:")
+        if s1:
+            lines.append(f"- {s1}")
+        if s2:
+            lines.append(f"- {s2}")
+    if pay:
+        lines.append(f"Төлбөрийн нөхцөл: {pay}")
+    if link:
+        lines.append(f"Бүртгүүлэх: {link}")
+    if cta:
+        lines.append(cta)
+
+    return "\n".join([ln for ln in lines if ln and ln.strip()])
+
+
 # ======================
 # Routes
 # ======================
@@ -388,12 +435,6 @@ def manychat_webhook():
         # Pull data (cached)
         all_courses = sheets_service.get_all_courses()
         all_faqs = sheets_service.get_all_faqs()
-
-        # Fast path: course match => template reply (no AI)
-        matched = sheets_service.get_course_by_keyword(message)
-        if matched:
-            text = format_course_template(matched)
-            return jsonify({"ai_response_text": text}), 200
 
         # Time budget guard
         if (time.time() - start) > app.config["TIME_BUDGET_SEC"]:
