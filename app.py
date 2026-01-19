@@ -55,7 +55,7 @@ class Config:
     MAX_DESC_CHARS = int(os.getenv("MAX_DESC_CHARS", "260"))
 
     # Dedup (idempotency)
-    DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "3"))
+    DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "30"))
     DEDUP_MAXSIZE = int(os.getenv("DEDUP_MAXSIZE", "5000"))
 
     # Template response limits
