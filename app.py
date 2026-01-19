@@ -238,6 +238,8 @@ class AIService:
             "5) Линк байвал Markdown биш, URL-ийг бүтнээр нь бич.\n"
             "6) Sheet-ээс тохирох хариултыг авч найруулан хариулт өг.\n"
             "7) Мэдээлэл өгөхдөө олон зүйл тайлбарлах бол bullet ашигла.\n"
+            "8) Markdown тэмдэгт (* _ ` #) огт ашиглахгүй.\n"
+            "9) Markdown тэмдэгт (* _ ` #) бүү ашигла. Bold/Italic хийхгүй. Зөвхөн plain text..\n"
         )
 
     def format_context(self, courses: List[Dict[str, Any]], faqs: List[Dict[str, Any]]) -> str:
