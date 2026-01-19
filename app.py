@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -79,6 +80,12 @@ def now_iso() -> str:
 def clamp(s: str, n: int) -> str:
     s = s or ""
     return s if len(s) <= n else s[:n].rstrip() + "..."
+
+def normalize_answer(t: str) -> str:
+    t = (t or "").strip()
+    t = re.sub(r"[*_`#]", "", t)          # Markdown арилгана
+    t = re.sub(r"\n\s*-\s*$", "", t)      # сүүлчийн дан '-' мөрийг авна
+    return t
 
 
 def manychat_v2(text: str):
@@ -451,6 +458,8 @@ def manychat_webhook():
         answer = ai_service.generate(message, context)
         if not answer:
             answer = "Уучлаарай, энэ асуултад одоогоор тодорхой хариулт олдсонгүй."
+            
+        answer = normalize_answer(answer)
 
         return jsonify({"ai_response_text": answer}), 200
 
