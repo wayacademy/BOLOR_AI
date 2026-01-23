@@ -188,20 +188,11 @@ class GoogleSheetsService:
         logger.info(f"✅ Loaded {len(out)} rows from '{sheet_name}' (cached)")
         return out
 
-    @staticmethod
-    def _safe_float(x: Any, default: float = 999.0) -> float:
-        try:
-            return float(str(x).strip())
-        except Exception:
-            return default
-
     def get_all_faqs(self) -> List[Dict[str, Any]]:
-        faqs = self.get_sheet_dicts("faq")
-        return sorted(faqs, key=lambda r: self._safe_float(r.get("priority", 999)))
+        return self.get_sheet_dicts("faq")
 
     def get_all_courses(self) -> List[Dict[str, Any]]:
-        courses = self.get_sheet_dicts("courses")
-        return sorted(courses, key=lambda r: self._safe_float(r.get("priority", 999)))
+        return self.get_sheet_dicts("courses")
 
     def get_course_by_keyword(self, user_text: str) -> Optional[Dict[str, Any]]:
         t = (user_text or "").lower().strip()
