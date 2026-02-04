@@ -50,8 +50,8 @@ class Config:
     TIME_BUDGET_SEC = float(os.getenv("TIME_BUDGET_SEC", "8.5"))
 
     # Context limits
-    MAX_COURSES_IN_CONTEXT = int(os.getenv("MAX_COURSES_IN_CONTEXT", "3"))
-    MAX_FAQS_IN_CONTEXT = int(os.getenv("MAX_FAQS_IN_CONTEXT", "5"))
+    MAX_COURSES_IN_CONTEXT = int(os.getenv("MAX_COURSES_IN_CONTEXT", "20"))
+    MAX_FAQS_IN_CONTEXT = int(os.getenv("MAX_FAQS_IN_CONTEXT", "20"))
     MAX_DESC_CHARS = int(os.getenv("MAX_DESC_CHARS", "260"))
 
     # Dedup (idempotency)
@@ -228,34 +228,24 @@ class AIService:
     def build_system_prompt(self) -> str:
         return (
             "Та бол Way Academy-гийн албан ёсны зөвлөх чатбот.\n"
-            "Зорилго: Хэрэглэгчийг зөв хөтөлбөр сонгоход чиглүүлж, бодит мэдээллийг товч, тодорхой хүргэх.\n"
+            "Зорилго: Хэрэглэгчийн асуултад өгөгдсөн контекстээс хариулах.\n"
             "\n"
-            "Ерөнхий дүрэм:\n"
-            "1) ЗӨВХӨН өгөгдсөн контекстээс хариул. Таамаглаж зохиож нэмэхгүй.\n"
-            "2) Монгол хэлээр, товч, ойлгомжтой бич.\n"
-            "3) Markdown тэмдэгт (* _ ` #) ашиглахгүй. Bold/Italic хийхгүй. Зөвхөн plain text.\n"
-            "4) Линк байвал URL-ийг бүтнээр нь бич (Markdown link хийхгүй).\n"
-            "5) Хариулт 900 тэмдэгтээс хэтрэхгүй. Олон зүйл бол 3–5 bullet ашигла.\n"
-            "6) Контекстэд байхгүй бол: 'Уучлаарай, энэ асуултад одоогоор тодорхой хариулт олдсонгүй.' гэж хэл.\n"
+            "Өгөгдөл ашиглах заавар:\n"
+            "1) ЗӨВХӨН доор өгөгдсөн 'COURSES' болон 'FAQ' хэсгээс мэдээллийг авч хариул. Гаднаас зохиож болохгүй.\n"
+            "2) Хэрэв хэрэглэгч тодорхой хөтөлбөрийн нэр дурдаагүй ч 'багш', 'үнэ', 'хугацаа' зэргийг асуувал:\n"
+            "   - Бүх хөтөлбөрийн тухайн мэдээллийг товч жагсааж бич.\n"
+            "   - Жишээ нь: 'DA хөтөлбөрийн багш ..., харин SDM хөтөлбөрийн багш ...'\n"
+            "3) Markdown тэмдэгт ашиглахгүй. Энгийн текстээр бич.\n"
             "\n"
-            "Хөтөлбөр санал болгох урсгал (заавал мөрдөнө):\n"
-            "7) Хэрэв хэрэглэгч 'хөтөлбөр', 'сургалт', 'ямар сургалт байна', 'course', 'program' зэрэг ерөнхий асуулт асуувал\n"
-            "   эхний удаад заавал доорх загвараар 4 хөтөлбөрийг товч танилцуулж, дараа нь сонголт асуу. Энэ үед үнэ/хуваарь зэрэг дэлгэрэнгүй мэдээлэл битгий өг.\n"
-            "   Загвар:\n"
-            "   Сайн байна уу?\n"
-            "   Бид хөдөлмөрийн зах зээл дээр эрэлттэй ур чадварыг салбарын шилдэг мэргэжилтнүүдээс богино хугацаанд эзэмшүүлэх хөтөлбөрүүдтэй.\n"
-            "   Мэргэжлүүд:\n"
-            "   - Стратегийн дижитал маркетинг (SDM)\n"
-            "   - Дата аналист (DA)\n"
-            "   - IT Бизнес шинжээч (ITBA)\n"
-            "   - Project Zero: AI Agent Developer (PZ)\n"
-            "   Та алийг нь илүү сонирхож байна вэ? (SDM/DA/ITBA/PZ)\n"
-            "\n"
-            "8) Хэрэв хэрэглэгч дээрх 4-өөс аль нэгийг (SDM/DA/ITBA/PZ) сонгож бичвэл тэр хөтөлбөрийн мэдээллийг контекстээс авч товч өг:\n"
-            "   - Хугацаа, хуваарь, үнэ (боломжтой бол Early Bird), төлбөрийн нөхцөл, бүртгүүлэх линк.\n"
-            "\n"
-            "9) Хэрэв хэрэглэгчийн асуулт тодорхойгүй бол зөвхөн 1 тодруулах асуулт асуу:\n"
-            "   'Та аль хөтөлбөрийг сонирхож байна вэ? (SDM/DA/ITBA/PZ)'\n"
+            "Хариулах хэлбэр:\n"
+            "- Хэрэв хэрэглэгч 'Сайн байна уу', 'ямар сургалт байна' гэх мэт ерөнхий асуувал:\n"
+            "  Сайн байна уу? Бид дараах эрэлттэй хөтөлбөрүүдийг санал болгож байна:\n"
+            "  - Стратегийн дижитал маркетинг (SDM)\n"
+            "  - Дата аналист (DA)\n"
+            "  - IT Бизнес шинжээч (ITBA)\n"
+            "  - Project Zero: AI Agent Developer (PZ)\n"
+            "  Та алийг нь сонирхож байна вэ?\n"
+            "- Хэрэв хэрэглэгч тодорхой асуулт (багш, үнэ г.м) асуувал шууд хариултыг нь өг.\n"
         )
 
     def format_context(self, courses: List[Dict[str, Any]], faqs: List[Dict[str, Any]]) -> str:
@@ -439,7 +429,7 @@ def manychat_webhook():
     if not subscriber_id or not message:
         return jsonify({"ai_response_text": "Уучлаарай, таны мессежийг уншиж чадсангүй. Дахин бичнэ үү."}), 200
 
-    # Dedup (optional but recommended)
+    # Dedup
     key = f"{subscriber_id}:{message}"
     if key in dedup_cache:
         logger.info(f"[MC] dedup hit: {key}")
@@ -450,7 +440,7 @@ def manychat_webhook():
         return jsonify({"ai_response_text": "Уучлаарай, одоогоор мэдээллийн сан холбогдоогүй байна."}), 200
 
     try:
-        # Pull data (cached)
+        # 1. Sheet-ээс бүх мэдээллийг татах
         all_courses = sheets_service.get_all_courses()
         all_faqs = sheets_service.get_all_faqs()
 
@@ -458,13 +448,19 @@ def manychat_webhook():
         if (time.time() - start) > app.config["TIME_BUDGET_SEC"]:
             return jsonify({"ai_response_text": "Уучлаарай, систем ачаалалтай байна. Дахин оролдоно уу."}), 200
 
-        # Small context for AI
-        courses_for_ctx = all_courses[: app.config["MAX_COURSES_IN_CONTEXT"]]
-        faqs_for_ctx = all_faqs[: app.config["MAX_FAQS_IN_CONTEXT"]]
-        context = ai_service.format_context(courses_for_ctx, faqs_for_ctx)
+        # --- ЗАСВАР ХИЙСЭН ХЭСЭГ ---
+        # Хуучин код:
+        # courses_for_ctx = all_courses[: app.config["MAX_COURSES_IN_CONTEXT"]]
+        # faqs_for_ctx = all_faqs[: app.config["MAX_FAQS_IN_CONTEXT"]]
+        
+        # Шинэ код: Хязгаарлалтыг авч хаяж, БҮХ мэдээллийг AI-д өгнө.
+        # gpt-4o-mini бүх өгөгдлийг уншиж чадна.
+        context = ai_service.format_context(all_courses, all_faqs) 
+        # ---------------------------
 
         # AI
         answer = ai_service.generate(message, context)
+        
         if not answer:
             answer = "Уучлаарай, энэ асуултад одоогоор тодорхой хариулт олдсонгүй."
             
