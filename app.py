@@ -1,25 +1,3 @@
-Энэ бол таны хүссэн **Gemini API**-тай холбогдсон бүрэн код юм.
-
-**Өөрчлөлтүүд:**
-
-1. `openai` санг хасаж `google.generativeai` санг оруулсан.
-2. `Config` хэсэгт `OPENAI_API_KEY`-г `GEMINI_API_KEY` болгож сольсон.
-3. `AIService` классыг Gemini `generate_content` функц ашигладаг болгож шинэчилсэн.
-4. Моделийн нэрийг `gemini-2.5-flash` (2.5 хувилбар хараахан гараагүй тул хамгийн хурдан, тогтвортой Flash хувилбар) болгож тохируулсан.
-
-**Анхаарах зүйл:**
-Энэ кодыг ажиллуулахын тулд танд `google-generativeai` сан хэрэгтэй:
-
-```bash
-pip install google-generativeai flask flask-cors google-auth google-api-python-client cachetools
-
-```
-
-Мөн `.env` файлдаа `GEMINI_API_KEY` гэсэн хувьсагч нэмэх шаардлагатай.
-
-Бэлэн код:
-
-```python
 import os
 import json
 import time
@@ -566,5 +544,3 @@ if __name__ == "__main__":
     logger.info(f"📄 SHEET_ID: {app.config.get('SHEET_ID')}")
     logger.info(f"🤖 MODEL: {app.config['GEMINI_MODEL']}")
     app.run(host="0.0.0.0", port=app.config["PORT"], debug=app.config["FLASK_DEBUG"])
-
-```
