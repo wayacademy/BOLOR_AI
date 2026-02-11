@@ -5,7 +5,7 @@
 1. `openai` санг хасаж `google.generativeai` санг оруулсан.
 2. `Config` хэсэгт `OPENAI_API_KEY`-г `GEMINI_API_KEY` болгож сольсон.
 3. `AIService` классыг Gemini `generate_content` функц ашигладаг болгож шинэчилсэн.
-4. Моделийн нэрийг `gemini-1.5-flash` (2.5 хувилбар хараахан гараагүй тул хамгийн хурдан, тогтвортой Flash хувилбар) болгож тохируулсан.
+4. Моделийн нэрийг `gemini-2.5-flash` (2.5 хувилбар хараахан гараагүй тул хамгийн хурдан, тогтвортой Flash хувилбар) болгож тохируулсан.
 
 **Анхаарах зүйл:**
 Энэ кодыг ажиллуулахын тулд танд `google-generativeai` сан хэрэгтэй:
@@ -69,7 +69,7 @@ class Config:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
     # "2.5 flash" гэж байхгүй тул одоогоор хамгийн сүүлийн stable хувилбар болох 1.5-flash-ийг сонгов.
     # Хэрэв 2.0 гарсан бол 'gemini-2.0-flash-exp' гэж сольж болно.
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
     # ManyChat time budget (~10s). Keep our budget lower.
     TIME_BUDGET_SEC = float(os.getenv("TIME_BUDGET_SEC", "8.5"))
