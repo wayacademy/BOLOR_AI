@@ -44,7 +44,7 @@ class Config:
 
     # OpenAI
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
 
     # ManyChat time budget (~10s). Keep our budget lower.
     TIME_BUDGET_SEC = float(os.getenv("TIME_BUDGET_SEC", "8.5"))
