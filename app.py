@@ -13,9 +13,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from cachetools import TTLCache
 
-# OpenAI-г хасаж, Google Generative AI-г оруулж ирэв
-import google.generativeai as genai
-from google.api_core.exceptions import GoogleAPIError
+from openai import OpenAI
+from openai import APIError, RateLimitError, APITimeoutError
 
 
 # ======================
@@ -43,11 +42,9 @@ class Config:
     # Cache
     CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # seconds
 
-    # Gemini Config (Updated)
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-    # "2.5 flash" гэж байхгүй тул одоогоор хамгийн сүүлийн stable хувилбар болох 1.5-flash-ийг сонгов.
-    # Хэрэв 2.0 гарсан бол 'gemini-2.0-flash-exp' гэж сольж болно.
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+    # OpenAI
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
     # ManyChat time budget (~10s). Keep our budget lower.
     TIME_BUDGET_SEC = float(os.getenv("TIME_BUDGET_SEC", "8.5"))
@@ -219,24 +216,14 @@ class GoogleSheetsService:
 
 
 # ======================
-# AI Service (Gemini)
+# AI Service (OpenAI)
 # ======================
 class AIService:
     def __init__(self, api_key: str, model: str):
-        self.model_name = model
-        self.api_key = api_key
-        
-        if self.api_key:
-            genai.configure(api_key=self.api_key)
-            # System prompt-ийг энд тодорхойлох нь илүү үр дүнтэй (Gemini GenerativeModel config)
-            self.system_instruction = self.build_system_prompt()
-            self.model = genai.GenerativeModel(
-                model_name=self.model_name,
-                system_instruction=self.system_instruction
-            )
-        else:
-            self.model = None
-            logger.warning("⚠️ GEMINI_API_KEY missing; AI disabled")
+        self.model = model
+        self.client = OpenAI(api_key=api_key) if api_key else None
+        if not api_key:
+            logger.warning("⚠️ OPENAI_API_KEY missing; AI disabled")
 
     def build_system_prompt(self) -> str:
         return (
@@ -312,30 +299,19 @@ class AIService:
         return "\n".join(parts)
 
     def generate(self, question: str, context: str) -> str:
-        if not self.model:
+        if not self.client:
             return "Уучлаарай, AI сервис түр ажиллахгүй байна."
 
-        try:
-            # Gemini-д зориулсан prompt бүтэц
-            full_prompt = (
-                f"Хэрэглэгчийн асуулт: {question}\n\n"
-                f"Доорх контекстээс хариул:\n{context}\n\n"
-                f"Хариулт:"
-            )
-
-            response = self.model.generate_content(
-                full_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.35,
-                    max_output_tokens=420,
-                )
-            )
-            
-            return (response.text or "").strip()
-        
-        except Exception as e:
-            logger.error(f"Gemini API Error: {e}")
-            return "Уучлаарай, системд алдаа гарлаа. Та дараа дахин оролдоно уу."
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": self.build_system_prompt()},
+                {"role": "user", "content": f"Хэрэглэгчийн асуулт: {question}\n\nДоорх контекстээс хариул:\n{context}\n\nХариулт:"},
+            ],
+            temperature=0.35,
+            max_tokens=420,
+        )
+        return (resp.choices[0].message.content or "").strip()
 
 
 # ======================
@@ -355,7 +331,7 @@ if app.config["SHEET_ID"] and app.config["GOOGLE_CREDENTIALS_JSON"]:
 else:
     logger.warning("⚠️ SHEET_ID / GOOGLE_CREDENTIALS_JSON missing")
 
-ai_service = AIService(api_key=app.config["GEMINI_API_KEY"], model=app.config["GEMINI_MODEL"])
+ai_service = AIService(api_key=app.config["OPENAI_API_KEY"], model=app.config["OPENAI_MODEL"])
 
 
 # ======================
@@ -412,7 +388,7 @@ def index():
     return jsonify(
         {
             "status": "active",
-            "service": "Way Academy Chatbot API (Gemini)",
+            "service": "Way Academy Chatbot API",
             "timestamp": now_iso(),
             "endpoints": {
                 "/health": "Health check",
@@ -428,11 +404,11 @@ def index():
 def health():
     services = {
         "google_sheets": bool(sheets_service),
-        "gemini": bool(app.config["GEMINI_API_KEY"]),
+        "openai": bool(app.config["OPENAI_API_KEY"]),
         "cache_ttl": app.config["CACHE_TTL"],
-        "model": app.config["GEMINI_MODEL"],
+        "model": app.config["OPENAI_MODEL"],
         "timestamp": now_iso(),
-        "version": "1.2.0-gemini",
+        "version": "1.1.0",
         "dedup_ttl": app.config["DEDUP_TTL_SEC"],
     }
     overall = "healthy" if services["google_sheets"] else "degraded"
@@ -472,8 +448,15 @@ def manychat_webhook():
         if (time.time() - start) > app.config["TIME_BUDGET_SEC"]:
             return jsonify({"ai_response_text": "Уучлаарай, систем ачаалалтай байна. Дахин оролдоно уу."}), 200
 
-        # Gemini Flash нь context window томтой тул бүх мэдээллийг өгч болно.
+        # --- ЗАСВАР ХИЙСЭН ХЭСЭГ ---
+        # Хуучин код:
+        # courses_for_ctx = all_courses[: app.config["MAX_COURSES_IN_CONTEXT"]]
+        # faqs_for_ctx = all_faqs[: app.config["MAX_FAQS_IN_CONTEXT"]]
+        
+        # Шинэ код: Хязгаарлалтыг авч хаяж, БҮХ мэдээллийг AI-д өгнө.
+        # gpt-4o-mini бүх өгөгдлийг уншиж чадна.
         context = ai_service.format_context(all_courses, all_faqs) 
+        # ---------------------------
 
         # AI
         answer = ai_service.generate(message, context)
@@ -542,5 +525,5 @@ def not_found(_):
 if __name__ == "__main__":
     logger.info(f"🚀 Starting on :{app.config['PORT']}")
     logger.info(f"📄 SHEET_ID: {app.config.get('SHEET_ID')}")
-    logger.info(f"🤖 MODEL: {app.config['GEMINI_MODEL']}")
+    logger.info(f"🤖 MODEL: {app.config['OPENAI_MODEL']}")
     app.run(host="0.0.0.0", port=app.config["PORT"], debug=app.config["FLASK_DEBUG"])
