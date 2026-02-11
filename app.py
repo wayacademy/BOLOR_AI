@@ -47,7 +47,7 @@ class Config:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
     # "2.5 flash" гэж байхгүй тул одоогоор хамгийн сүүлийн stable хувилбар болох 1.5-flash-ийг сонгов.
     # Хэрэв 2.0 гарсан бол 'gemini-2.0-flash-exp' гэж сольж болно.
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
 
     # ManyChat time budget (~10s). Keep our budget lower.
     TIME_BUDGET_SEC = float(os.getenv("TIME_BUDGET_SEC", "8.5"))
